@@ -1,0 +1,31 @@
+// Design tokens. Import with `@use 'tokens' as t;` (sassOptions.loadPaths points here).
+
+$color-bg: #f6f8f7;
+$color-surface: #fff;
+$color-text: #14231f;
+$color-muted: #5b6b66;
+$color-border: #d9e2de;
+$color-primary: #0f766e;
+$color-primary-contrast: #fff;
+
+// Trust levels shown next to every citation (1 = official ... 4 = unverified).
+$trust-colors: (
+  1: #15803d,
+  2: #0f766e,
+  3: #b45309,
+  4: #b91c1c,
+);
+$space-1: 0.25rem;
+$space-2: 0.5rem;
+$space-3: 0.75rem;
+$space-4: 1rem;
+$space-6: 1.5rem;
+$space-8: 2rem;
+$radius: 0.5rem;
+$font-sans:
+  system-ui,
+  -apple-system,
+  'Segoe UI',
+  roboto,
+  sans-serif;
+$content-width: 52rem;

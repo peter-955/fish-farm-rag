@@ -1,0 +1,14 @@
+@use 'sass:map';
+@use 'tokens' as t;
+
+@mixin card {
+  background: t.$color-surface;
+  border: 1px solid t.$color-border;
+  border-radius: t.$radius;
+  padding: t.$space-4;
+}
+
+@mixin trust-badge($level) {
+  color: map.get(t.$trust-colors, $level);
+  border: 1px solid currentcolor;
+}

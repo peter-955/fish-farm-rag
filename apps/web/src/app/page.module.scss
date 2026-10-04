@@ -1,0 +1,12 @@
+@use 'tokens' as t;
+@use 'mixins' as m;
+
+.main {
+  max-width: t.$content-width;
+  margin: 0 auto;
+  padding: t.$space-8 t.$space-4;
+}
+
+.card {
+  @include m.card;
+}

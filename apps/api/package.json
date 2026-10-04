@@ -1,0 +1,43 @@
+{
+  "name": "@ffr/api",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "nest build",
+    "start": "node dist/main",
+    "start:dev": "nest start --watch",
+    "dev": "nest start --watch",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "typeorm": "typeorm-ts-node-commonjs -d src/database/data-source.ts",
+    "migration:run": "pnpm typeorm migration:run",
+    "migration:generate": "pnpm typeorm migration:generate",
+    "migration:revert": "pnpm typeorm migration:revert",
+    "codegen:rag-client": "echo \"rag-client codegen arrives in Phase 5\""
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.0",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/core": "^11.1.0",
+    "@nestjs/platform-express": "^11.1.0",
+    "@nestjs/typeorm": "^11.0.0",
+    "pg": "^8.16.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.0",
+    "typeorm": "^0.3.25",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@ffr/config": "workspace:*",
+    "@nestjs/cli": "^11.0.0",
+    "@nestjs/testing": "^11.1.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.0",
+    "eslint": "^9.30.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

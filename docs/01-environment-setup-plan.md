@@ -21,7 +21,7 @@ Scope of this doc: environment + skeleton only (no real RAG logic yet).
 
 | Concern | Decision | Why |
 |---|---|---|
-| RAG framework | **Haystack 2.x** in a **Python** service (`apps/rag`), FastAPI + worker | Haystack is Python-only; ships pgvector, Ollama, Anthropic integrations |
+| RAG framework | **Haystack** (`haystack-ai`, resolved to **3.3.0** in Phase 1) in a **Python** service (`apps/rag`), FastAPI + worker | Haystack is Python-only; ships pgvector, Ollama, Anthropic integrations |
 | App API | **NestJS + TypeORM** (`apps/api`) | TypeORM first-class; `@Sse()` for streaming chat |
 | Frontend | **Next.js + SCSS** modules + React Query (`apps/web`) | Your stack |
 | Chat transport | **SSE end-to-end**: rag-api → Nest → browser `EventSource` | Token streaming; simple, HTTP-only, auto-reconnect |
@@ -235,6 +235,21 @@ from your phone. Nothing is exposed to the public internet.
    - Add a tiny `package.json` with `lint`/`test` scripts that call `uv run …`, so Turbo covers it.
 7. Root scripts: `dev`, `build`, `lint`, `typecheck`, `test`, `db:migrate`, `db:migration:generate`, `codegen:rag-client`.
 8. `.gitignore`: `data/`, `.env`, `.venv/`, `__pycache__/`, `node_modules/`, `.next/`, `dist/`, `*.dump`.
+
+**Status: ✅ done** (branch `claude/pensive-pascal-azgt7t`). `pnpm turbo lint typecheck test build` passes 12/12 locally.
+
+Notes from implementation:
+- **Haystack resolved to 3.3.0**, not 2.x as this plan first assumed. The component names in §1.2
+  (`DocumentJoiner`, `PgvectorKeywordRetriever`, `OllamaChatGenerator`, …) must be re-checked against 3.x in Phase 5
+  before writing the pipelines. `uv.lock` pins every version.
+- **Python 3.12 is pinned** via `.python-version` and `requires-python`; uv downloads it if the host lacks it.
+- **SCSS:** Next's sass loader only found the shared partials with an absolute path in
+  `sassOptions.loadPaths`/`includePaths` (see `apps/web/next.config.mjs`), so `@use 'tokens' as t;` works from any depth.
+- **`apps/web` typecheck** doesn't depend on `.next` output, so it can run in parallel with the build.
+- **Turborepo writes an `AGENTS.md`** into the repo when it detects an AI agent. It is switched off with
+  `"agentGuidance": false` in `turbo.json`.
+- `docs/` is in `.prettierignore` so Prettier doesn't rewrite the plan's tables.
+- **Not yet run here:** a real container build and the API against a live Postgres (no Docker in the dev sandbox) — that's Phase 2.
 
 **Done when:** `pnpm turbo lint typecheck test build` is green on the empty skeleton.
 

@@ -1,0 +1,7 @@
+pnpm-lock.yaml
+uv.lock
+.next
+dist
+data
+apps/rag/.venv
+docs

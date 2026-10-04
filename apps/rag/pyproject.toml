@@ -1,0 +1,45 @@
+[project]
+name = "ffr-rag"
+version = "0.0.0"
+description = "Haystack RAG service (API + ingestion worker) for fish-farm-rag"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "haystack-ai",
+  "pgvector-haystack",
+  "ollama-haystack",
+  "anthropic-haystack",
+  "fastapi",
+  "uvicorn[standard]",
+  "psycopg[binary]",
+  "pydantic-settings",
+  "ocrmypdf",
+  "pypdf",
+]
+
+[dependency-groups]
+dev = ["ruff", "pyright", "pytest", "httpx"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ffr_rag"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

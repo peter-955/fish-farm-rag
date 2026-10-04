@@ -1,0 +1,12 @@
+{
+  "name": "@ffr/rag",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Thin wrapper so Turborepo can run the Python app's checks.",
+  "scripts": {
+    "lint": "uv run ruff check . && uv run ruff format --check .",
+    "typecheck": "uv run pyright",
+    "test": "uv run pytest -q",
+    "build": "echo \"rag image is built by docker compose\""
+  }
+}
