@@ -9,7 +9,7 @@
 
 Status: **draft v3**
 - Stack: Haystack + NestJS/TypeORM + Next.js/SCSS.
-- Hosting: a **Mac mini** running Docker containers.
+- Hosting: a **Mac mini (M1, 16 GB)** running Docker containers.
 - Cost: **near-zero running cost** (local LLM by default, Claude only on demand).
 - Tooling: our own, no dependency on `dirigeo-monorepo`.
 
@@ -194,9 +194,12 @@ brew services start ollama            # launchd → starts on boot
 ollama pull bge-m3                    # embeddings (~1.2 GB)
 ollama pull <local chat model>        # see §5 for choosing by RAM
 ```
-Ollama env, set via `launchctl setenv` or the brew service plist:
-- `OLLAMA_KEEP_ALIVE=10m` unloads models when idle, which frees RAM.
+Ollama env, set via `launchctl setenv` or the brew service plist. The full list and the reasoning for M1 16 GB are in §5.3:
+- `OLLAMA_FLASH_ATTENTION=1`
+- `OLLAMA_KV_CACHE_TYPE=q8_0`
 - `OLLAMA_MAX_LOADED_MODELS=2` keeps embedding + chat loaded together.
+- `OLLAMA_NUM_PARALLEL=1`
+- `OLLAMA_KEEP_ALIVE=15m` unloads models when idle, which frees RAM.
 
 Containers reach it at `http://host.docker.internal:11434`. Both OrbStack and Docker Desktop route this to the
 host's loopback, so Ollama stays bound to `127.0.0.1`.
@@ -204,7 +207,7 @@ host's loopback, so Ollama stays bound to `127.0.0.1`.
 **macOS settings for a home server**
 - Energy: *Prevent automatic sleeping*, *Start up automatically after a power failure*, *Wake for network access*.
 - Users & Groups: automatic login for the server user, so OrbStack/Docker and Ollama start after a reboot.
-- OrbStack/Docker: *Start at login*. Memory limit ≈ 6 GB is plenty for the containers (the LLM runs outside).
+- OrbStack/Docker: *Start at login*. **Memory limit 4 GB.** The LLM runs outside the VM and needs the rest (§5.3).
 - FileVault: if it's on, an unattended reboot after power loss waits at the unlock screen. Accept that, or turn it off on this machine.
 
 **Tailscale:** sign in. After Phase 2: `tailscale serve --bg 8080` → `https://<mac-mini>.<tailnet>.ts.net`
@@ -238,6 +241,16 @@ from your phone. Nothing is exposed to the public internet.
 ### Phase 2 — Docker Compose
 
 `infra/compose.yml`. All services use `restart: unless-stopped`, healthchecks, and `depends_on: condition: service_healthy`.
+Each service also gets a `mem_limit`, which must fit the 4 GB VM:
+
+| Service | `mem_limit` |
+|---|---|
+| `db` | 512m |
+| `rag-worker` | 1g (OCR bursts) |
+| `rag-api` | 512m |
+| `api` | 256m |
+| `web` | 256m |
+| `caddy` | 64m |
 
 | Service | Image / build | Host port | Volumes | Notes |
 |---|---|---|---|---|
@@ -450,19 +463,52 @@ Per Claude question at ~3.5k input + ~600 output tokens:
 With local-first plus a budget of $3, the expected bill is **~$0–2/month**. Haiku 4.5 is the default for
 "Hỏi Claude". Switching `CLAUDE_MODEL` to Sonnet 5.5 for harder questions is a one-line change.
 
-### 5.3 Choosing the local chat model (by Mac mini RAM)
+### 5.3 Local model on the target machine: Mac mini M1, 16 GB
 
-Vietnamese quality varies a lot between open models, so choose by the Phase 5 bake-off rather than by
-benchmark tables. Candidates are recent multilingual instruct models available in Ollama (e.g. the current Qwen
-and Gemma generations), plus a Vietnamese-tuned model if one is available in GGUF/Ollama form.
+**Memory budget** (unified memory is shared by CPU and GPU):
 
-| Mac mini unified memory | Practical local chat model size (Q4) | Notes |
+| Consumer | ≈ RAM |
+|---|---|
+| macOS + background apps | 3.5–4 GB |
+| OrbStack VM: all containers (Postgres ~0.3, rag-api + rag-worker ~1, api ~0.15, web ~0.15, caddy, OCR bursts) | capped at **4 GB** |
+| Ollama: `bge-m3` (embeddings) | ~1.2 GB |
+| Ollama: chat model 7–9B @ Q4_K_M | ~4.5–5.5 GB |
+| Ollama: KV cache for `num_ctx` 6144 (q8_0) | ~0.5 GB |
+| **Total** | **~14–15 GB** → workable, but no room for a bigger model or for dev tooling on this machine |
+
+**Decisions that follow:**
+- **Chat model size: 7–9B, Q4_K_M.** A 12B+ model will push the machine into swap. Bake-off candidates:
+  the current Qwen ~8B instruct, the current Gemma in the 4B / ≤9B range, and a Vietnamese-tuned 7B if
+  one is on Ollama. Pick by the Phase 5 test.
+- **Ollama settings** (`launchctl setenv …`, then restart the service):
+  - `OLLAMA_FLASH_ATTENTION=1`
+  - `OLLAMA_KV_CACHE_TYPE=q8_0` (halves KV-cache memory)
+  - `OLLAMA_MAX_LOADED_MODELS=2`
+  - `OLLAMA_NUM_PARALLEL=1`
+  - `OLLAMA_KEEP_ALIVE=15m`
+- **Context:** `num_ctx = 6144`. Budget: top 5 chunks × ~600 tokens + ~500 system/prompt + ≤ 800 answer ≈ 4.3k.
+- **OrbStack:** memory limit 4 GB; per-service `mem_limit` in compose so one runaway service can't starve Ollama.
+- **Don't develop on the Mac mini.** It runs only `compose.yml` (built images). `next dev`, `nest --watch`,
+  IDEs and `compose.dev.yml` stay on your laptop.
+- **Ingestion runs one job at a time**: worker concurrency 1, `ocrmypdf --jobs 2`. Bulk imports of whole books go
+  overnight. Chatting during a bulk import works but is slower.
+
+**Expected speed** (rough; measure in Phase 5):
+
+| Step | M1 estimate | Comment |
 |---|---|---|
-| 16 GB | 7–9B | Fine for short grounded answers; keep `OLLAMA_KEEP_ALIVE` short |
-| 24 GB | 12–14B | Sweet spot for quality vs. speed |
-| 32 GB+ | up to ~30B-class | Noticeably better synthesis; slower first token |
+| OCR (Tesseract, container) | ~3–6 s/page → 300-page book ≈ 15–30 min | overnight batch |
+| Embedding (bge-m3, Metal) | 300-page book (~600 chunks) ≈ a few minutes | fine |
+| Answer: time to first token | ~10–30 s (processing ~4k prompt tokens) | the `sources` SSE event arrives first, so the UI isn't blank |
+| Answer: generation | ~12–20 tokens/s | a 400-token answer streams in ~20–30 s |
 
-Budget about 4–6 GB of RAM for macOS + containers + bge-m3 on top of the chat model.
+If time-to-first-token feels too slow:
+1. Drop to top 4 × 500-token chunks.
+2. Try a 4B model, if its Vietnamese still passes the bake-off.
+3. Use "Hỏi Claude" for that question (answers in a few seconds, ≈ $0.0065).
+
+**Upgrade path:** if you replace the Mac mini later, 24 GB+ allows a 12–14B model. Only `LOCAL_CHAT_MODEL`
+changes; nothing else in the architecture does.
 
 ---
 
@@ -480,6 +526,6 @@ Budget about 4–6 GB of RAM for macOS + containers + bge-m3 on top of the chat 
 | 8 | Social-media misinformation | Trust levels in chunk meta + citations + low-trust warning |
 | 9 | Data loss over years | Nightly dumps + Time Machine; optionally a second off-site copy later |
 
-Question for you:
-1. **Mac mini chip and RAM** (e.g. M2 16 GB, M4 24 GB)? This fixes the local model size in §5.3 and whether
-   indexing and chatting can run at the same time without swapping.
+| 10 | M1 16 GB memory pressure (swap → very slow answers) | 7–9B Q4 model, KV cache q8_0, 4 GB VM cap, per-service `mem_limit`, no dev tooling on the mini; watch *Memory Pressure* in Activity Monitor and `ollama ps` |
+
+All open questions are resolved. Target machine: **Mac mini M1, 16 GB**. Next step: Phase 1.
