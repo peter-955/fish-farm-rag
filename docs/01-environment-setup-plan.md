@@ -7,7 +7,8 @@
 >
 > Non-goals for now: low latency, multi-user, horizontal scale.
 
-Status: **draft v1** · Scope of this doc: environment + skeleton only (no RAG logic yet).
+Status: **draft v2** — stack fixed to **Haystack + TypeORM + SCSS, everything in Docker Compose on the local machine**.
+Scope of this doc: environment + skeleton only (no real RAG logic yet).
 
 ---
 
@@ -15,72 +16,158 @@ Status: **draft v1** · Scope of this doc: environment + skeleton only (no RAG l
 
 | Concern | Decision | Why |
 |---|---|---|
-| Repo shape | pnpm + Turborepo monorepo, TypeScript end-to-end | Reuse `dirigeo-monorepo` setup; one language for web, worker, and shared code |
-| Web app | Next.js (App Router) — chat, upload, library browser, quick-capture | Existing stack; Route Handlers cover the API, no separate backend needed |
-| Database | **One Postgres** with `pgvector` + `unaccent` | Vectors, metadata, full-text, and job queue in one cheap box |
-| ORM | Drizzle (or whatever dirigeo uses — keep consistent) | Typed schema, plain SQL escape hatch for vector/FTS queries |
-| Job queue | `pg-boss` (Postgres-backed) | No Redis to run/pay for; ingestion is slow & batchy anyway |
-| Embeddings | **`bge-m3` via Ollama, local** (1024-dim, multilingual, good Vietnamese) | $0 per token; CPU is fine because speed doesn't matter |
-| Keyword search | Postgres FTS, `simple` config over `unaccent(content)` | No built-in Vietnamese stemmer; unaccent lets `ca ro phi` match `cá rô phi` |
-| Retrieval | Hybrid (vector + FTS) merged with Reciprocal Rank Fusion; reranker later | Vietnamese technical terms + species names benefit a lot from lexical match |
-| Generation | Claude API via `@anthropic-ai/sdk`, model set by env var | Strong Vietnamese, native citations support; swap model without code change |
-| OCR | `ocrmypdf` + Tesseract `vie` in Docker; Claude vision as fallback for bad pages | Free for clean scans; pay only for pages Tesseract butchers |
-| Hosting (phase 1) | Local machine via Docker Compose | $0; move to a small VPS only when needed |
+| RAG framework | **Haystack 2.x** (`haystack-ai`) in a **Python** service (`apps/rag`) | Haystack is Python-only; it ships pgvector, Ollama and Anthropic integrations |
+| RAG service API | FastAPI wrapping Haystack pipelines + a worker process from the same image | Explicit endpoints we control; worker handles slow ingestion |
+| App API | **NestJS + TypeORM** (`apps/api`) | TypeORM works best with NestJS: decorators, DI, migrations CLI. See §1.4 for the Next-only alternative |
+| Frontend | **Next.js + SCSS** (CSS Modules `*.module.scss`) + React Query (`apps/web`) | Your existing stack |
+| Database | **One Postgres 17** with `pgvector`, `unaccent`, `pg_trgm` | Vectors, metadata, full-text search and job queue in one container |
+| Schema ownership | TypeORM migrations own all **app** tables; Haystack's `PgvectorDocumentStore` owns the **chunk** table | Each tool manages what it understands; no second ORM in Python |
+| Job queue | `ingest_jobs` table + Python worker using `SELECT … FOR UPDATE SKIP LOCKED` | No Redis; jobs survive restarts; works across TS↔Python |
+| Embeddings | `bge-m3` via **Ollama** (1024-dim, multilingual, good Vietnamese) | $0 per token; CPU speed is fine |
+| Retrieval | Hybrid: `PgvectorEmbeddingRetriever` + `PgvectorKeywordRetriever` → `DocumentJoiner` (reciprocal rank fusion) | Lexical match matters for species names and technical terms |
+| Generation | `AnthropicChatGenerator` (anthropic-haystack), model set by env var | Strong Vietnamese; switch model without code change |
+| OCR | `ocrmypdf` + Tesseract `vie` **installed in the rag image** (Python lib + CLI) | Free; Claude vision only as a per-page fallback later |
+| TS ↔ Python contract | FastAPI OpenAPI → generated TS client (`openapi-typescript`) used by `apps/api` | Typed boundary without hand-written DTO duplication |
+| Hosting | Local machine, `docker compose`, ports bound to `127.0.0.1` only | $0; nothing exposed to the network |
 
 ---
 
-## 1. Reusing `dirigeo-monorepo`
+## 1. Architecture
 
-⚠️ **Blocker:** this session could not access `dirigeo-monorepo` (not in the list of repos my GitHub
-credential can see — it may live under another owner/org, or the Claude GitHub App isn't installed there).
-The structure below is therefore **assumed**; once access is granted, step 1.2 becomes a concrete diff.
+```
+ Browser
+   │  http://localhost:3000
+   ▼
+┌──────────────┐  REST (React Query)  ┌───────────────┐   HTTP (generated client)   ┌──────────────────────┐
+│ web          │ ───────────────────▶ │ api           │ ──────────────────────────▶ │ rag-api (FastAPI)    │
+│ Next.js+SCSS │                      │ NestJS+TypeORM│   /ask, /health              │ Haystack query pipe  │
+└──────────────┘                      └──────┬────────┘                              └─────────┬────────────┘
+                                             │ TypeORM: sources, tags,                         │ embed query (Ollama)
+                                             │ ingest_jobs, qa_log                             │ retrieve (pgvector+FTS)
+                                             │ writes uploads → ./data/raw                     │ generate (Claude API)
+                                             ▼                                                 ▼
+                                   ┌──────────────────────────────────────────────────────────────────┐
+                                   │ db: Postgres 17 + pgvector + unaccent                            │
+                                   │  app tables (TypeORM)  │  haystack_chunks (PgvectorDocumentStore)│
+                                   └──────────────────────────────────────────────────────────────────┘
+                                             ▲                                                 ▲
+                                             │ poll ingest_jobs (SKIP LOCKED)                  │
+                                   ┌─────────┴────────────┐   embed chunks   ┌─────────────────┴──┐
+                                   │ rag-worker (Python)  │ ───────────────▶ │ ollama (bge-m3)    │
+                                   │ OCR → convert → clean│                  └────────────────────┘
+                                   │ → split → embed →    │
+                                   │ write (Haystack)     │  reads ./data/raw, writes ./data/ocr
+                                   └──────────────────────┘
+```
 
-### 1.1 What to carry over (expected)
-- Root tooling: `package.json` (workspaces/scripts), `pnpm-workspace.yaml`, `turbo.json`, `.nvmrc`/`engines`
-- Shared configs: `packages/config` (or equivalent) — `tsconfig` bases, ESLint, Prettier
-- Git hygiene: `.editorconfig`, `.gitignore`, commit hooks (husky/lefthook + lint-staged), commitlint if used
-- CI: GitHub Actions workflow for install → lint → typecheck → test → build
-- Next.js app conventions: folder structure, SCSS setup, React Query provider, API client pattern, env validation (zod/t3-env)
-- Docker Compose patterns, if any
+**Ingestion flow:** upload in `web` → `api` saves the file to `/data/raw/<sha256>.<ext>`, inserts `sources`
+(status `pending`) and an `ingest_jobs` row → `rag-worker` claims the job → OCR if needed → Haystack indexing
+pipeline writes chunks with `meta.source_id` → worker sets `sources.status = ready` (or `failed` + error).
 
-### 1.2 What to drop
-- Product-specific apps/packages, auth providers, analytics, deploy targets (Vercel/etc.), domain code
-- Any paid services not needed for a single-user tool
+**Query flow:** `web` → `api` `POST /ask` → `rag-api` runs the query pipeline → returns the answer and the cited
+chunk metadata → `api` writes `qa_log` and returns to `web`.
 
-### 1.3 Procedure
-1. Copy the root tooling + `packages/config` into this repo (no git history needed — fresh start is cleaner).
-2. Rename package scope to `@ffr/*` (fish-farm-rag).
-3. Scaffold apps/packages from section 2 using dirigeo's Next.js app as the template for `apps/web`.
-4. `pnpm install && pnpm turbo lint typecheck build` must pass on an empty skeleton before adding anything.
+### 1.1 Haystack pipelines (skeleton targets)
+
+Indexing (`rag-worker`):
+```
+FileTypeRouter → PyPDFToDocument / TextFileToDocument (after ocrmypdf for scans)
+  → DocumentCleaner → (custom) VietnameseNormalizer [NFC, OCR line-break/hyphen fixes]
+  → RecursiveDocumentSplitter (~600–800 tokens, overlap ~10%)
+  → OllamaDocumentEmbedder(model="bge-m3")
+  → DocumentWriter(PgvectorDocumentStore, policy=OVERWRITE)
+```
+Query (`rag-api`):
+```
+OllamaTextEmbedder ─▶ PgvectorEmbeddingRetriever ─┐
+query text ──────────▶ PgvectorKeywordRetriever  ──┴▶ DocumentJoiner(reciprocal_rank_fusion)
+  → ChatPromptBuilder (Vietnamese system prompt, numbered sources [1]..[n] with trust level)
+  → AnthropicChatGenerator(model=$LLM_MODEL)
+```
+Note: Don't use NLTK sentence splitting (`split_by="sentence"`). Its models don't cover Vietnamese.
+Use the recursive/passage splitting above. Start with numbered `[n]` citations in the prompt. Native
+Claude citations would need a custom component; consider them later.
+
+### 1.2 Chunk table (owned by Haystack)
+
+`PgvectorDocumentStore(table_name="haystack_chunks", embedding_dimension=1024, vector_function="cosine_similarity", search_strategy="hnsw", language="simple", create_table=True)`.
+
+- `language="simple"`: Postgres has no Vietnamese text-search config.
+- Every chunk's `meta` holds `source_id`, `page_from`, `page_to`, `heading_path`, `trust_level`,
+  `tags`, `embedding_model`. This lets Haystack metadata filters do "only trust ≤ 2" or "only cá tra".
+- `trust_level` is copied into `meta` at index time. If a source's trust level changes, `api` enqueues a
+  `resync_meta` job (rare, cheap).
+- Known limitation: the built-in keyword retriever doesn't apply `unaccent`. Queries typed **with** diacritics
+  match fine. Queries typed without them (`ca ro phi`) rely on vector search alone. If that hurts in practice,
+  add a small custom Haystack component that runs our own SQL with `f_unaccent` (function created in §3 Phase 2).
+- Pin the `pgvector-haystack` version, because the table schema and the keyword query are defined by the
+  integration. Check the generated DDL after each upgrade.
+
+### 1.3 Schema ownership rule
+
+- TypeORM is the **only** thing that runs DDL for app tables (`synchronize: false` always, explicit migrations).
+- Haystack creates and owns `haystack_chunks`. `apps/api` can read it through an entity marked
+  `@Entity({ name: 'haystack_chunks', synchronize: false })`, so migration generation ignores it. It never
+  writes to it.
+- Python touches app tables only through a handful of plain SQL statements (`psycopg`): claim a job, update job
+  status, update source status. These live in one module (`apps/rag/src/ffr_rag/db.py`). No SQLAlchemy.
+
+### 1.4 Why NestJS for TypeORM (and the alternative)
+
+TypeORM inside Next.js route handlers works, but it causes friction:
+- decorator/metadata config for SWC
+- keeping a DataSource singleton alive across HMR
+- `serverExternalPackages`
+- running migrations outside the Next runtime
+
+A small NestJS app avoids all of that, and it gives job orchestration and the rag-api proxy a natural home.
+The cost is one more container (~100 MB RAM).
+**Alternative:** Next.js only (web + route handlers + TypeORM), which means one fewer service. Pick this if
+`dirigeo-monorepo` already solves TypeORM in Next.
 
 ---
 
-## 2. Target repository layout
+## 2. Repository layout
 
 ```
 fish-farm-rag/
 ├─ apps/
-│  ├─ web/                 # Next.js: chat UI, source library, upload, quick-capture, API route handlers
-│  └─ worker/              # Node process: pg-boss consumers for the ingestion pipeline
+│  ├─ web/                    # Next.js (App Router), SCSS modules, React Query
+│  │  └─ src/styles/          # _tokens.scss, _mixins.scss, globals.scss
+│  ├─ api/                    # NestJS + TypeORM
+│  │  └─ src/
+│  │     ├─ database/         # data-source.ts (CLI + app), migrations/
+│  │     ├─ sources/          # entity, controller, service (upload, list, status)
+│  │     ├─ ingest-jobs/      # entity + enqueue service
+│  │     ├─ ask/              # proxy to rag-api, writes qa_log
+│  │     └─ rag-client/       # generated from rag-api OpenAPI
+│  └─ rag/                    # Python 3.12, uv-managed
+│     ├─ pyproject.toml / uv.lock
+│     ├─ src/ffr_rag/
+│     │  ├─ api.py            # FastAPI app: /health, /ask
+│     │  ├─ worker.py         # job loop: claim → run indexing pipeline → update status
+│     │  ├─ pipelines/        # indexing.py, query.py (Haystack)
+│     │  ├─ components/       # VietnameseNormalizer, (later) UnaccentKeywordRetriever
+│     │  ├─ db.py             # psycopg: ingest_jobs + sources status SQL
+│     │  └─ settings.py       # pydantic-settings, reads env
+│     └─ tests/
 ├─ packages/
-│  ├─ config/              # tsconfig / eslint / prettier (from dirigeo)
-│  ├─ db/                  # Drizzle schema, migrations, SQL helpers (hybrid search query lives here)
-│  ├─ core/                # Shared types + zod schemas (Source, Chunk, TrustLevel, job payloads)
-│  ├─ ingest/              # Extract → clean → chunk → embed (pure functions, used by worker)
-│  └─ rag/                 # Retrieve → build prompt → call Claude → map citations
+│  └─ config/                 # shared tsconfig / eslint / prettier (from dirigeo)
 ├─ infra/
-│  ├─ docker-compose.yml   # postgres+pgvector, ollama, (optional) adminer
-│  ├─ postgres/init.sql    # CREATE EXTENSION vector, unaccent, pg_trgm; immutable unaccent wrapper
-│  └─ ocr/                 # ocrmypdf invocation notes / Dockerfile if customised
-├─ scripts/                # one-off CLIs: bulk import a folder, re-embed, backup
-├─ data/                   # ⛔ gitignored: raw PDFs/images, OCR output, backups
+│  ├─ compose.yml             # all services, prod-like builds
+│  ├─ compose.dev.yml         # overrides: bind mounts + hot reload
+│  ├─ postgres/init.sql       # extensions + f_unaccent
+│  └─ docker/                 # Dockerfiles: web, api, rag (multi-stage)
+├─ scripts/                   # backup.sh, restore.sh, bulk-import
+├─ data/                      # ⛔ gitignored, bind-mounted: raw/, ocr/, backups/
 ├─ docs/
-└─ .env.example
+├─ .env.example
+└─ Makefile                   # thin wrappers: up, down, logs, migrate, pull-models, backup
 ```
 
-Why `ingest` and `rag` are packages and not inside the apps: both the worker and CLI scripts need
-ingestion, and both the web app and a future eval script need retrieval. Keeping them as pure-ish
-packages also makes them unit-testable without Next.js.
+The pnpm/Turborepo workspace covers `apps/web`, `apps/api` and `packages/*`. `apps/rag` is a standalone
+`uv` project. Turbo can still call its `lint`/`test` through a tiny `package.json` with scripts that run
+`uv run ruff check` / `uv run pytest`, so `pnpm turbo lint test` covers everything.
 
 ---
 
@@ -88,45 +175,69 @@ packages also makes them unit-testable without Next.js.
 
 Each phase ends with a **done when** check. Do them in order; each is roughly an evening.
 
-### Phase 0 — Prerequisites on the dev machine
+### Phase 0 — Prerequisites on the host
 
 | Tool | Version | Notes |
 |---|---|---|
-| Node.js | Current LTS (match dirigeo's `.nvmrc`) | Use `fnm`/`nvm` |
-| pnpm | via `corepack enable` | Version pinned in root `packageManager` field |
-| Docker + Compose v2 | latest | Postgres, Ollama, OCR all run in containers |
-| Ollama | latest | Can run in Docker **or** natively (native is easier for GPU/Apple Silicon) |
-| Git, VS Code | — | Recommended extensions from dirigeo's `.vscode/` |
+| Docker Engine / Docker Desktop + Compose v2 | latest | Runs everything |
+| Node.js + pnpm (`corepack enable`) | current LTS (match dirigeo `.nvmrc`) | For IDE, type-checking, codegen outside containers |
+| Python 3.12 + `uv` | — | For IDE/pyright and running tests outside containers |
+| Git, VS Code (+ Docker, Python, ESLint, Stylelint extensions) | — | |
 | Anthropic API key | — | console.anthropic.com → set a **monthly spend limit** (e.g. $20) |
 
-Hardware: 8 GB RAM is enough (bge-m3 ≈ 1.2 GB on disk, ~2–3 GB RAM at runtime). ~20 GB free disk for
-models, DB, and raw scans.
+Hardware: **16 GB RAM recommended** (8 GB works if you stop `web` dev mode while batch-indexing). Rough
+footprint: Postgres ~300 MB, Ollama + bge-m3 ~2–3 GB, Haystack services ~0.5–1 GB, Nest + Next dev
+~1 GB. Disk: ~20 GB for images, models, DB and scans.
 
-**Done when:** `node -v`, `pnpm -v`, `docker compose version`, `ollama -v` all work.
+macOS note: Docker Desktop on Mac can't use the Apple GPU. CPU embedding in the Ollama container is fine at
+this scale. If bulk-indexing many books feels too slow, run Ollama natively and point
+`OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+
+**Done when:** `docker compose version`, `pnpm -v`, `uv --version` all work.
 
 ### Phase 1 — Monorepo skeleton
 
-1. Port tooling from dirigeo (section 1.3).
-2. Create empty workspaces from section 2, each with `package.json`, `tsconfig.json`, `src/index.ts`.
-3. Root scripts (turbo pipelines): `dev`, `build`, `lint`, `typecheck`, `test`, `db:generate`, `db:migrate`, `db:studio`.
-4. Test runner: Vitest (or dirigeo's choice).
-5. `.gitignore` must include `data/`, `.env*` (except `.env.example`), `*.dump`.
+1. Port root tooling from `dirigeo-monorepo`: workspace, turbo, `packages/config`, git hooks, CI (see §4).
+2. `apps/web`: `create-next-app` (TS, App Router, no Tailwind) + `sass`; create `src/styles/_tokens.scss`
+   (colors, spacing, typography) and use CSS Modules per component. Add Stylelint (`stylelint-config-standard-scss`).
+3. `apps/api`: `nest new` → add `@nestjs/typeorm typeorm pg @nestjs/config`. Use one `data-source.ts`
+   exported for both the Nest module (`TypeOrmModule.forRootAsync`) and the CLI
+   (`typeorm-ts-node-commonjs migration:run -d src/database/data-source.ts`).
+4. `apps/rag`: `uv init --package` → `uv add haystack-ai pgvector-haystack ollama-haystack anthropic-haystack fastapi uvicorn[standard] psycopg[binary] pydantic-settings ocrmypdf pypdf`;
+   dev deps `ruff pytest pyright`. **Pin exact versions** in `uv.lock`.
+5. Root scripts: `dev`, `build`, `lint`, `typecheck`, `test`, `db:migrate`, `db:migration:generate`, `codegen:rag-client`.
+6. `.gitignore`: `data/`, `.env`, `.venv/`, `__pycache__/`, `*.dump`.
 
-**Done when:** `pnpm turbo lint typecheck test build` is green on the empty skeleton and CI runs it on push.
+**Done when:** `pnpm turbo lint typecheck test build` is green on the empty skeleton (including the Python app via its wrapper scripts).
 
-### Phase 2 — Local infrastructure (Docker Compose)
+### Phase 2 — Docker Compose infrastructure
 
-`infra/docker-compose.yml` services:
+`infra/compose.yml` (abridged — healthchecks + `depends_on: condition: service_healthy` everywhere):
 
-| Service | Image | Port | Volume |
-|---|---|---|---|
-| `db` | `pgvector/pgvector:pg17` | 5432 | `pgdata` |
-| `ollama` | `ollama/ollama` (skip if running natively) | 11434 | `ollama` |
-| `adminer` (optional) | `adminer` | 8080 | — |
+| Service | Image / build | Port (host) | Volumes | Notes |
+|---|---|---|---|---|
+| `db` | `pgvector/pgvector:pg17` | `127.0.0.1:5432` | `pgdata`, `./postgres/init.sql:/docker-entrypoint-initdb.d/` | healthcheck `pg_isready` |
+| `ollama` | `ollama/ollama` | `127.0.0.1:11434` | `ollama` (models) | |
+| `ollama-pull` | `ollama/ollama` | — | — | one-shot: `ollama pull bge-m3` against `ollama`, then exits |
+| `rag-api` | `infra/docker/rag.Dockerfile` | `127.0.0.1:8000` | `../data:/data` | `uvicorn ffr_rag.api:app` |
+| `rag-worker` | same image as `rag-api` | — | `../data:/data` | `python -m ffr_rag.worker` |
+| `api` | `infra/docker/api.Dockerfile` | `127.0.0.1:4000` | `../data:/data` | runs `migration:run` on start, then `node dist/main` |
+| `web` | `infra/docker/web.Dockerfile` | `127.0.0.1:3000` | — | Next.js `output: 'standalone'` |
+| `adminer` (profile `tools`) | `adminer` | `127.0.0.1:8080` | — | `docker compose --profile tools up` |
 
-OCR is **not** a long-running service — the worker shells out to it on demand:
-`docker run --rm -v $PWD/data:/data jbarlow83/ocrmypdf --language vie+eng --deskew --clean in.pdf out.pdf`
-(check `tesseract --list-langs` includes `vie`; install `tesseract-ocr-vie` in a custom image if not).
+Dockerfile notes:
+- **rag**: `python:3.12-slim` + `apt-get install tesseract-ocr tesseract-ocr-vie ghostscript qpdf unpaper`
+  (needed by ocrmypdf) + `uv sync --frozen --no-dev`. Multi-stage so build tools don't ship.
+- **api / web**: `node:<lts>-slim`, pnpm `fetch` + `--filter` deploy (`pnpm deploy`) for small images.
+
+`infra/compose.dev.yml` overrides for daily development:
+- `web`: `pnpm --filter web dev`, bind-mount source, `WATCHPACK_POLLING=true` if file watching is flaky on macOS/Windows
+- `api`: `pnpm --filter api start:dev`, bind-mount source
+- `rag-api`: `uvicorn --reload`, bind-mount `apps/rag/src`
+- `rag-worker`: bind-mount source; restart manually (`docker compose restart rag-worker`) after changes
+- `node_modules` / `.venv` kept in **named volumes**, not bind-mounted from the host
+
+Usage: `make up` → `docker compose -f infra/compose.yml -f infra/compose.dev.yml --env-file .env up -d`.
 
 `infra/postgres/init.sql`:
 ```sql
@@ -134,131 +245,144 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- unaccent() is STABLE, so it can't be used in a generated column/index directly.
+-- unaccent() is STABLE, so it can't be used in an index directly; this wrapper is for a future custom keyword retriever.
 CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
   LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
   AS $$ SELECT public.unaccent('public.unaccent', $1) $$;
 ```
-
-Pull the embedding model once: `ollama pull bge-m3`.
+(`init.sql` only runs on an empty volume. Mirror it in the first TypeORM migration with `IF NOT EXISTS`, so
+the migrations are the source of truth.)
 
 **Done when:**
-- `docker compose up -d` → `psql` shows `vector`, `unaccent` in `\dx`
-- `curl localhost:11434/api/embed -d '{"model":"bge-m3","input":"Nuôi cá rô phi trong ao đất"}'` returns a 1024-length vector
+- `make up` → all services `healthy` in `docker compose ps`
+- `docker compose exec db psql -U ffr -c '\dx'` lists `vector`, `unaccent`
+- `curl 127.0.0.1:11434/api/embed -d '{"model":"bge-m3","input":"Nuôi cá rô phi trong ao đất"}'` returns 1024 floats
 
-### Phase 3 — Database schema (first migration)
+### Phase 3 — Database schema (TypeORM migrations)
 
-Minimal tables — enough to support trust-aware citations from day one:
+App tables (entities in `apps/api`, snake_case naming strategy):
 
 **`sources`** — one row per book / article / social post / note
-- `id`, `kind` (`book | article | paper | social_post | video | personal_note`)
+- `id uuid`, `kind` enum (`book | article | paper | social_post | video | personal_note`)
 - `title`, `author`, `publisher`, `published_at`, `url`, `language` (default `vi`)
-- `trust_level` smallint 1–4 (see below), `trust_note` (why I trust/distrust it)
-- `file_path`, `checksum` (dedupe), `status` (`pending | processing | ready | failed`), `error`
-- `created_at`, `updated_at`
+- `trust_level smallint` 1–4, `trust_note`
+- `file_path`, `checksum` (unique → dedupe), `status` enum (`pending | processing | ready | failed`), `error`
+- `chunk_count`, `created_at`, `updated_at`
 
-**`chunks`**
-- `id`, `source_id` FK, `ordinal`, `content`, `heading_path` (e.g. `Chương 3 > Quản lý chất lượng nước`)
-- `page_from`, `page_to` (books), `token_count`
-- `embedding vector(1024)` + **HNSW** index (`vector_cosine_ops`)
-- `tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', f_unaccent(content))) STORED` + GIN index
-- `metadata jsonb` (OCR confidence, etc.)
+**`ingest_jobs`** — the queue
+- `id`, `source_id` FK, `type` (`index | reindex | resync_meta | delete_chunks`)
+- `status` (`queued | running | done | failed`), `attempts`, `last_error`, `run_after`, `locked_at`, timestamps
+- index on `(status, run_after)`. The worker claims with
+  `UPDATE … WHERE id = (SELECT id … WHERE status='queued' AND run_after<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`
 
-**`tags`** / **`source_tags`** — species (`cá tra`, `rô phi`, `tôm thẻ`…), topic (`nước`, `bệnh`, `thức ăn`, `con giống`, `kinh tế`)
+**`tags`**, **`source_tags`** — species (`cá tra`, `rô phi`, `tôm thẻ`…), topic (`nước`, `bệnh`, `thức ăn`, `con giống`, `kinh tế`)
 
-**`qa_log`** — `question`, `answer`, `cited_chunk_ids`, `model`, `tokens_in/out`, `rating` (👍/👎), `note`
-→ becomes the evaluation set later; costs nothing to start collecting now.
+**`qa_log`** — `question`, `answer`, `cited` jsonb (chunk ids + source ids), `model`, `tokens_in`, `tokens_out`, `latency_ms`, `rating`, `note`
+→ becomes the evaluation set later.
 
-**Trust levels** (shown next to every citation in answers):
+**Trust levels** (shown next to every citation):
 | Level | Meaning | Examples |
 |---|---|---|
-| 1 | Official / academic | Bộ NN&PTNT / Cục Thủy sản guidelines, university textbooks, extension centre (khuyến nông) manuals, peer-reviewed papers |
+| 1 | Official / academic | Bộ NN&PTNT / Cục Thủy sản guidelines, university textbooks, khuyến nông manuals, peer-reviewed papers |
 | 2 | Reputable practitioner | Published farming handbooks, established trade magazines |
-| 3 | Verified community | Social posts from people I've checked, or claims corroborated by a level-1/2 source |
-| 4 | Unverified | Anything else captured "for later checking" |
+| 3 | Verified community | Social posts from people I've checked, or corroborated by a level 1–2 source |
+| 4 | Unverified | Captured "for later checking" |
 
-**Done when:** `pnpm db:migrate` on a fresh DB creates all tables + indexes; a seed script inserts one
-source with two chunks and a hand-written hybrid query returns them.
+`haystack_chunks` is created by `rag-api` on startup (`create_table=True`), not by TypeORM (§1.3).
+
+**Done when:** a fresh `docker compose down -v && make up` creates every table through migrations plus
+`haystack_chunks` through Haystack, and `pnpm db:migration:generate` reports **no changes** (it ignores the
+Haystack table).
 
 ### Phase 4 — Configuration & secrets
 
-`.env.example` (validated at startup with zod in `packages/core`):
+`.env.example` (validated at startup: `@nestjs/config` + zod in `api`, `pydantic-settings` in `rag`):
 ```dotenv
-DATABASE_URL=postgres://ffr:ffr@localhost:5432/ffr
-OLLAMA_BASE_URL=http://localhost:11434
+# Postgres
+POSTGRES_USER=ffr
+POSTGRES_PASSWORD=change-me
+POSTGRES_DB=ffr
+DATABASE_URL=postgresql://ffr:change-me@db:5432/ffr
+PG_CONN_STR=postgresql://ffr:change-me@db:5432/ffr      # name expected by PgvectorDocumentStore
+
+# Models
+OLLAMA_BASE_URL=http://ollama:11434
 EMBEDDING_MODEL=bge-m3
 EMBEDDING_DIM=1024
 ANTHROPIC_API_KEY=
-LLM_MODEL=claude-opus-5-5          # see cost table in §5 — switch to claude-sonnet-5-5 / claude-haiku-4-5 if you prefer cheaper
-OCR_FALLBACK_MODEL=claude-sonnet-5-5
-DATA_DIR=./data
+LLM_MODEL=claude-opus-5-5         # see §5 — claude-sonnet-5-5 / claude-haiku-4-5 are cheaper
+
+# Services
+RAG_API_URL=http://rag-api:8000
+API_URL=http://api:4000            # used server-side by web
+NEXT_PUBLIC_API_URL=http://localhost:4000
+DATA_DIR=/data
 ```
 
-- Never commit `.env`. **This repository is currently public** → either make it private, or be extra strict
-  that nothing under `data/` and no library scans ever get committed (copyright + privacy).
-- `EMBEDDING_MODEL` + `EMBEDDING_DIM` are stored per chunk batch (in `metadata`) so a later model switch can
-  re-embed incrementally instead of silently mixing vector spaces.
+- Hostnames are compose service names (`db`, `ollama`, …). When running a service outside Docker, override them with `localhost`.
+- **The repo is public.** Never commit `.env` or anything under `data/`. Making the repo private is recommended.
+- Every chunk stores `embedding_model` in `meta`, so switching models later means a controlled re-index instead of mixed vector spaces.
 
-**Done when:** `apps/web` and `apps/worker` both fail fast with a clear message if a required var is missing.
+**Done when:** each service fails fast with a clear message when a required var is missing.
 
-### Phase 5 — App & worker shells
+### Phase 5 — Service shells (end-to-end with no-op logic)
 
-- `apps/web`: Next.js app from dirigeo template; pages `/` (chat), `/sources` (list + status), `/sources/new`
-  (upload file / paste URL / quick note), health route `GET /api/health` that pings DB + Ollama.
-- `apps/worker`: starts pg-boss, registers no-op handlers for queues `extract`, `ocr`, `chunk`, `embed`.
-  Each handler updates `sources.status` so the UI can show progress.
-- Dev command: `pnpm dev` runs both via turbo (`docker compose up -d` as a pre-step or documented).
+- **rag-api**: `GET /health` (checks DB + Ollama + that the document store opens), `POST /ask` returns a stub answer. OpenAPI at `/openapi.json`.
+- **rag-worker**: claim loop (poll every 5 s, exponential backoff, `attempts` ≤ 3). An `index` job runs the
+  real indexing pipeline on a plain `.txt` file. This is the first real Haystack run.
+- **api**: `GET /health` (DB + rag-api), `POST /sources` (multipart upload with multer → `/data/raw`, sha256
+  dedupe, insert source + job), `GET /sources`, `GET /sources/:id`, `POST /ask` (proxy + `qa_log`).
+  `pnpm codegen:rag-client` generates the client from `rag-api`'s OpenAPI.
+- **web**: layout + SCSS tokens; pages `/` (ask box + answer + sources list), `/sources` (table with status
+  polling via React Query `refetchInterval`), `/sources/new` (upload / paste note with trust level + tags).
 
-**Done when:** uploading a file in the UI creates a `sources` row, enqueues `extract`, and the worker log shows it
-flowing through all four no-op stages to `ready`.
+**Done when:** uploading a `.txt` in the browser ends as `ready` with `chunk_count > 0`, and
+`SELECT count(*) FROM haystack_chunks WHERE meta->>'source_id' = '<id>'` matches.
 
-### Phase 6 — Developer workflow & CI
+### Phase 6 — Developer workflow, CI, backups
 
-- CI (GitHub Actions): pnpm cache → lint → typecheck → unit tests → build. Add a job with a
-  `pgvector/pgvector` service container to run migration + repository tests.
-- No AI calls in CI (mock `rag` / `ingest` boundaries) — keeps CI free and deterministic.
-- `scripts/backup.sh`: `pg_dump -Fc` + tar of `data/raw` → `data/backups/` (later: sync to R2/B2, cents/month).
+- **Makefile**: `up`, `down`, `logs s=<svc>`, `migrate`, `pull-models`, `psql`, `backup`, `restore f=<file>`.
+- **CI** (GitHub Actions): pnpm cache → lint/typecheck/test/build for TS; `uv sync` → `ruff`, `pyright`, `pytest`
+  for rag. One job with a `pgvector/pgvector:pg17` service container runs migrations and the job-claim SQL tests.
+  **No model calls in CI.** Ollama and Anthropic are mocked behind Haystack component boundaries.
+- Optional: build all images in CI (`docker compose build`) to catch Dockerfile breakage.
+- **Backups**: `scripts/backup.sh` runs `docker compose exec db pg_dump -Fc` plus a tar of `data/raw` into
+  `data/backups/<date>/`. Keep the last N copies. Later, copy them off-machine (external drive or R2/B2, cents/month).
+  The DB can always be rebuilt from `data/raw` by re-indexing, but OCR and trust metadata cost time, so back up both.
 
-**Done when:** a PR runs CI green, and a backup can be restored into a fresh container.
+**Done when:** CI is green on a PR, and `make restore` brings a fresh volume back to the same `sources`/chunk counts.
 
 ---
 
-## 4. What comes after environment setup (for context, not in scope here)
+## 4. Reusing `dirigeo-monorepo`
 
-1. **Ingestion v1** — PDF (text layer) via `pdfjs-dist`/`unpdf`; scanned PDF/images via ocrmypdf; plain text/notes.
-   Chunking: ~500–800 tokens, split on headings/paragraphs, 10–15% overlap; keep page numbers.
-2. **Vietnamese text cleanup** — Unicode NFC normalisation (OCR and copy-paste mix NFC/NFD, which breaks
-   both FTS and dedupe), fix hyphenation/line breaks from OCR, strip headers/footers/page numbers.
-3. **Retrieval v1** — hybrid query (top-k vector + top-k FTS → RRF) with filters on tags and min trust level.
-4. **Answering v1** — Claude with retrieved chunks passed as `document` blocks with **citations enabled**,
-   system prompt in Vietnamese: answer only from sources, say "không đủ thông tin" when unsure, flag when
-   only level-3/4 sources support a claim, surface disagreements between sources.
-5. **Quick-capture for social posts** — a paste form (text + URL + author + trust level) first; a bookmarklet later.
-6. **Eval** — 30–50 real questions from `qa_log`, re-run after any chunking/model change.
-7. Later: reranker (`bge-reranker-v2-m3`), image-heavy pages (disease photos), farm journal data.
+⚠️ This session still can't access `dirigeo-monorepo`. My GitHub credential can't see it under
+`peter-955`, so it probably lives under another owner/org, or the Claude GitHub App isn't installed there.
+
+Expected to carry over: root workspace/turbo config, `packages/config` (tsconfig/eslint/prettier), git hooks,
+CI workflow, Next.js app conventions (SCSS structure, React Query provider, API client pattern, env validation),
+and any NestJS/TypeORM module patterns or Dockerfiles it already has.
+Drop: product-specific apps/packages, auth, analytics, cloud deploy targets.
+
+Once I can read it, this section becomes an exact copy list, and §1.4 (NestJS vs Next-only TypeORM) can follow
+whatever dirigeo already does.
 
 ---
 
 ## 5. Cost estimate (personal use)
 
-Embeddings and OCR run locally → **$0**. Only answer generation and occasional OCR fallback cost money.
+Embeddings, OCR and hosting are local → **$0**. Only answer generation costs money.
 
 Assume 20 questions/day × ~8k input tokens (retrieved chunks + prompt) and ~800 output tokens
 → ≈ 4.8 M input + 0.5 M output tokens/month.
 
-| Model (`LLM_MODEL`) | Price in/out per 1M tok | ≈ Monthly |
+| `LLM_MODEL` | Price in/out per 1M tok | ≈ Monthly |
 |---|---|---|
 | `claude-opus-5-5` | $4 / $20 | ≈ $29 |
 | `claude-sonnet-5-5` | $2 / $10 | ≈ $15 |
 | `claude-haiku-4-5` | $1 / $5 | ≈ $7 |
 
-OCR fallback with Claude vision: roughly 1–2k tokens per page → a 300-page bad scan is a few dollars
-on Sonnet 5.5; only used for pages where Tesseract confidence is low.
-
-Infra: $0 on a local machine. If you later want access from your phone at the farm: a 4 GB VPS
-(≈ $5–8/month) runs Postgres + Ollama + Next.js comfortably at this scale.
-
-Set a hard monthly spend limit in the Anthropic console and log `tokens_in/out` per answer in `qa_log`.
+Set a hard monthly spend limit in the Anthropic console. `qa_log.tokens_in/out` tracks the real usage.
 
 ---
 
@@ -266,15 +390,17 @@ Set a hard monthly spend limit in the Anthropic console and log `tokens_in/out` 
 
 | # | Item | Proposed handling |
 |---|---|---|
-| 1 | **Access to `dirigeo-monorepo`** | Grant access (or tell me its `owner/repo`) so Phase 1 reuses it precisely |
-| 2 | OCR quality on old Vietnamese prints (diacritics) | Measure on 2–3 real books early; Claude vision fallback per page |
-| 3 | Copyright of library material | Personal use only; keep raw files and full text out of git; private repo recommended |
-| 4 | Social-media misinformation | Trust levels + mandatory citations + "only low-trust sources" warning in answers |
-| 5 | Embedding model lock-in | Model name/dim stored with chunks; re-embed script |
-| 6 | Data loss over a multi-year horizon | Automated `pg_dump` + raw file backup to object storage from Phase 6 |
+| 1 | Access to `dirigeo-monorepo` | Grant access / tell me its `owner/repo` |
+| 2 | Two languages (TS + Python) | Strict boundary: Python only talks to Postgres, Ollama, Claude; TS talks to Python only via generated OpenAPI client |
+| 3 | `pgvector-haystack` owns chunk table schema | Pin version; read-only TypeORM entity; review DDL on upgrade |
+| 4 | Keyword search without accent folding | Accept for v1; custom retriever with `f_unaccent` if needed |
+| 5 | OCR quality on old Vietnamese prints | Test 2–3 real books early; Claude vision fallback for low-confidence pages |
+| 6 | Copyright of library material | Personal use; raw files never in git; private repo recommended |
+| 7 | Social-media misinformation | Trust levels in chunk meta + mandatory citations + warning when only level 3–4 support a claim |
+| 8 | Data loss over a multi-year horizon | Backups from Phase 6, copied off-machine |
 
 Questions for you:
-1. Where does `dirigeo-monorepo` live (owner/org), and should I copy its ORM/test runner choices as-is?
-2. Make `fish-farm-rag` private? (recommended given library material)
-3. Dev machine: macOS (Apple Silicon) / Windows+WSL / Linux? — affects running Ollama natively vs in Docker.
-4. Answer model default: keep `claude-opus-5-5`, or start cheaper with Sonnet 5.5 / Haiku 4.5?
+1. Where does `dirigeo-monorepo` live? Does it already use NestJS + TypeORM?
+2. Is NestJS for the API OK (recommended), or do you want Next.js route handlers + TypeORM to save a service?
+3. Host OS: macOS / Windows (WSL2) / Linux? This decides whether Ollama runs in Docker or natively.
+4. Should the default answer model be Opus 5.5, or start cheaper with Sonnet 5.5 / Haiku 4.5?
