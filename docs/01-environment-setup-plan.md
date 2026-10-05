@@ -317,6 +317,47 @@ CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
 ```
 (Mirrored in the first TypeORM migration with `IF NOT EXISTS`, so the migrations stay the source of truth.)
 
+**Status: ✅ written and partly verified — needs a first run on a machine with a Docker daemon.**
+
+Files: `infra/compose.yml`, `infra/compose.dev.yml`, `infra/caddy/Caddyfile`, `infra/postgres/init.sql`,
+`infra/docker/{web,api,rag}.Dockerfile`, `.dockerignore`, `.env.example`, `Makefile`.
+
+Verified in the dev sandbox (no Docker daemon there, so no image was built):
+- `docker compose config` accepts both compose files; a missing `POSTGRES_*` value fails with a clear message.
+- Container memory limits total ~2.6 GB, inside the 4 GB OrbStack cap.
+- **Web:** the Next standalone output has the layout the image copies (`apps/web/server.js`); it serves the page and its CSS.
+- **Api:** a production-only install in the image's layout runs `typeorm migration:run` from `dist/` and boots; against a
+  real Postgres, `/api/health` returns `db: up`.
+- **Rag:** a `--no-dev` environment (no pytest/ruff/pyright) serves `/health`; the worker exits 0 on SIGTERM.
+- **`init.sql`** on a real Postgres: `f_unaccent` turns `Cá rô phi — nuôi trong ao đất` into `Ca ro phi - nuoi trong ao dat`,
+  works inside a generated `tsvector` column with a GIN index, and a query typed without accents (`ca ro phi`) matches.
+  Re-running it is safe. A 1024-dim `vector` column with an HNSW index also works.
+  (Tested on Postgres 16 + a separate pgvector build because no single server here had both; the real image is
+  `pgvector/pgvector:pg17`.)
+
+**Not verified yet** (run these on the Mac mini): `docker compose build`, all services reaching `healthy`, Caddy streaming,
+and the container → native Ollama connection.
+
+Where this differs from the plan above:
+- `db` publishes **no host port** in `compose.yml`; `compose.dev.yml` publishes `127.0.0.1:5432`. Use `make psql` on the mini.
+- `compose.dev.yml` only adds the DB port, uvicorn `--reload`, and the `adminer` profile. **web and api are run on the host**
+  with `pnpm dev` (avoids pnpm's `node_modules` symlinks breaking inside bind mounts).
+- The rag image is **single-stage**: all dependencies install from wheels, so there is no build toolchain to discard.
+- The api image does **not** use `pnpm deploy` (it packs by gitignore rules and could drop `dist/`); a prod-deps stage is
+  copied alongside the built `dist/` instead.
+- `ollama-pull` one-shot service dropped: Ollama is native, so `make pull-models` runs `ollama pull bge-m3` on the host.
+- `rag-worker` is an idle placeholder (logs and waits) so `restart: unless-stopped` doesn't crash-loop until Phase 5.
+- `make up` refuses to run while `POSTGRES_PASSWORD` is still `change-me`.
+
+Bugs found and fixed while testing:
+- **`nest build` silently emitted nothing** after the first build, because `incremental: true` left a `.tsbuildinfo` outside `dist/`
+  while Nest deletes `dist/` each time. Phase 1's passing "build" was hollow for the api. `incremental` is removed there.
+- `next build` rewrites `apps/web/tsconfig.json` (re-adding `incremental` and a `.next/types` include), which made `typecheck`
+  race the build; it now runs `next typegen && tsc --noEmit`.
+- An inline `# comment` after an empty value in `.env` was parsed as the value (`LOCAL_CHAT_MODEL` became the comment text).
+- One `@ffr/api#test` failure appeared once in a full pipeline run and could not be reproduced in 12 further runs; the
+  failure output was not captured. If it recurs in CI, investigate it rather than re-running.
+
 **Done when:**
 - `make up` → everything is `healthy`
 - `http://127.0.0.1:8080` shows the Next page and `/api/health` returns OK, including the `rag-api` → Ollama check

@@ -1,0 +1,168 @@
+# Production-like stack for the Mac mini. Run from the repo root via `make up`
+# (docker compose --env-file .env -f infra/compose.yml up -d).
+#
+# Ollama is NOT here: it runs natively on macOS to use the Apple GPU, and the
+# containers reach it at host.docker.internal:11434.
+name: fish-farm-rag
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-host-gateway: &host-gateway
+  extra_hosts:
+    - 'host.docker.internal:host-gateway'
+
+x-db-url: &db-url postgresql://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+
+services:
+  db:
+    <<: *restart
+    image: pgvector/pgvector:pg17
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Sized for the 512m cap. maintenance_work_mem covers HNSW index builds.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - maintenance_work_mem=96MB
+      - -c
+      - max_connections=30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rag-api:
+    <<: [*restart, *host-gateway]
+    build:
+      context: ..
+      dockerfile: infra/docker/rag.Dockerfile
+    image: ffr-rag:local
+    mem_limit: 512m
+    environment: &rag-env
+      DATABASE_URL: *db-url
+      PG_CONN_STR: *db-url
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      LOCAL_CHAT_MODEL: ${LOCAL_CHAT_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-haiku-4-5}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      DATA_DIR: /data
+    volumes:
+      - ../data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  rag-worker:
+    <<: [*restart, *host-gateway]
+    image: ffr-rag:local
+    mem_limit: 1g
+    command: ['python', '-m', 'ffr_rag.worker']
+    environment: *rag-env
+    volumes:
+      - ../data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      rag-api:
+        condition: service_healthy # reuse the already-built image; also ensures haystack_chunks exists
+
+  api:
+    <<: [*restart, *host-gateway]
+    build:
+      context: ..
+      dockerfile: infra/docker/api.Dockerfile
+    image: ffr-api:local
+    mem_limit: 256m
+    environment:
+      NODE_ENV: production
+      PORT: '4000'
+      DATABASE_URL: *db-url
+      RAG_API_URL: http://rag-api:8000
+      DATA_DIR: /data
+    volumes:
+      - ../data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s # migrations run before the server starts
+
+  web:
+    <<: *restart
+    build:
+      context: ..
+      dockerfile: infra/docker/web.Dockerfile
+    image: ffr-web:local
+    mem_limit: 256m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  caddy:
+    <<: *restart
+    image: caddy:2-alpine
+    mem_limit: 64m
+    # Single entry point. Bound to loopback; expose it to your tailnet with `tailscale serve`.
+    ports:
+      - '127.0.0.1:8080:8080'
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/api/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

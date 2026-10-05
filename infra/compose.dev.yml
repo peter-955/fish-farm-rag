@@ -1,0 +1,27 @@
+# Development overrides, layered on compose.yml (`make up-dev`). Meant for your laptop,
+# NOT the Mac mini, which only runs compose.yml.
+#
+# web and api are run on the host with `pnpm dev` (fast HMR, no bind-mount/symlink pitfalls with
+# pnpm's node_modules); this file exposes what they need and adds hot reload for the Python API.
+services:
+  db:
+    ports:
+      - '127.0.0.1:5432:5432' # host-side `pnpm db:migrate`, psql, TypeORM CLI
+
+  rag-api:
+    command: ['uvicorn', 'ffr_rag.api:app', '--host', '0.0.0.0', '--port', '8000', '--reload']
+    ports:
+      - '127.0.0.1:8000:8000'
+    volumes:
+      - ./../apps/rag/src:/app/src:ro
+      - ../data:/data
+
+  adminer:
+    profiles: ['tools']
+    image: adminer
+    mem_limit: 128m
+    ports:
+      - '127.0.0.1:8081:8080'
+    depends_on:
+      db:
+        condition: service_healthy

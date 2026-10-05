@@ -1,0 +1,16 @@
+{
+	admin off
+}
+
+:8080 {
+	handle /api/* {
+		reverse_proxy api:4000 {
+			# Stream SSE chunks to the browser immediately instead of buffering.
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}

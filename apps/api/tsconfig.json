@@ -10,8 +10,7 @@
     "emitDecoratorMetadata": true,
     "experimentalDecorators": true,
     "strictPropertyInitialization": false,
-    "isolatedModules": false,
-    "incremental": true
+    "isolatedModules": false
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
