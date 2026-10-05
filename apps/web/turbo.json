@@ -1,0 +1,10 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "typecheck": {
+      // `next build` and `next typegen` both rewrite .next/, so they must not run in parallel.
+      "dependsOn": ["^build", "build"]
+    }
+  }
+}

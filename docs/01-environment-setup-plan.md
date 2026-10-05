@@ -393,9 +393,49 @@ Bugs found and fixed while testing:
 | 3 | Verified community | Posts from people I've checked, or corroborated by level 1–2 |
 | 4 | Unverified | Captured "for later checking" |
 
+**Status: ✅ done and tested against a real Postgres** (entities in `apps/api/src/{sources,ingest-jobs,tags,chat}/*.entity.ts`,
+one migration `apps/api/src/database/migrations/*-InitialSchema.ts`).
+
+What exists:
+- Tables `sources`, `ingest_jobs`, `tags`, `source_tags`, `qa_log`, with snake_case columns (`typeorm-naming-strategies`),
+  `gen_random_uuid()` primary keys (`uuidExtension: 'pgcrypto'`), and `timestamptz` timestamps.
+- **Closed sets are `varchar` + `CHECK`, not Postgres enum types** (kind, status, trust level, job type/status, QA mode/status,
+  rating, tag category). Adding a value later is a one-line migration instead of `ALTER TYPE`. Default `trust_level` is 4 (unverified).
+- Foreign keys: deleting a source cascades to its jobs and tag links; deleting a tag only removes the links.
+- `sources.checksum` is a unique index (de-duplication); it is nullable, so many sources can have none.
+- `qa_log.cost_usd` is `numeric(10,5)` with a transformer so TypeScript sees a `number` (needed for the monthly budget sum).
+- The migration **also creates the extensions** (`vector`, `unaccent`, `pg_trgm`, `pgcrypto`) and `f_unaccent`, so it can
+  bootstrap a bare database; `init.sql` only duplicates that for a fresh Docker volume. `down()` leaves extensions in place
+  because Haystack's table depends on them.
+- `haystack_chunks` is **not** an entity: Haystack creates it (Phase 5) and TypeORM never sees it, so it can't be diffed or dropped.
+
+Checks (run against a disposable database that has pgvector + contrib):
+- `pnpm db:migration:check` fails (exit 1) if entities and the migrated schema differ, i.e. a migration is missing.
+- `apps/api/src/database/schema.integration.spec.ts` (13 tests) runs when `TEST_DATABASE_URL` is set, otherwise it is skipped:
+  it wipes the `public` schema, runs the migration from a bare database, checks no drift, every constraint and cascade,
+  accent-folded full-text search, the `numeric` round-trip, and the **job-claim SQL** (documented in
+  `ingest-job.entity.ts`, reused verbatim by the Python worker in Phase 5): two concurrent workers get different jobs
+  (`FOR UPDATE SKIP LOCKED`), oldest first, and jobs scheduled in the future are skipped.
+  ```bash
+  TEST_DATABASE_URL=postgresql://postgres:pw@127.0.0.1:5432/ffr_test pnpm --filter @ffr/api test
+  ```
+  CI will run this against a `pgvector/pgvector:pg17` service container in Phase 6.
+
+Found while building this:
+- A generated `DEFAULT '[]'::jsonb` made `migration:generate` want to rewrite the column on every run; declaring the entity
+  default as `'[]'` removes the drift. The drift check is what caught it.
+- `next build` and `next typegen` both rewrite `apps/web/.next`, so running web's `typecheck` and `build` in parallel
+  failed intermittently with `ENOENT` (reproduced on roughly 1 run in 9). Web's `typecheck` now depends on its `build`
+  (`apps/web/turbo.json`).
+- Turborepo hides environment variables it doesn't know about, which silently skipped the database tests inside
+  `pnpm turbo test`; `TEST_DATABASE_URL` is now declared for the `test` task.
+
+Not verified yet: the `api` container applying this migration at startup against `pgvector/pgvector:pg17`
+(needs Docker; the migration itself ran on Postgres 16 with pgvector 0.6).
+
 **Done when:**
 - `docker compose down -v && make up` recreates all tables (and `haystack_chunks` via rag-api)
-- `pnpm db:migration:generate` reports no changes
+- `pnpm db:migration:check` reports no changes
 
 ### Phase 4 — Configuration & secrets
 

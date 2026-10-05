@@ -15,6 +15,7 @@
     "format:check": "prettier --check .",
     "db:migrate": "pnpm --filter @ffr/api migration:run",
     "db:migration:generate": "pnpm --filter @ffr/api migration:generate",
+    "db:migration:check": "pnpm --filter @ffr/api migration:check",
     "codegen:rag-client": "pnpm --filter @ffr/api codegen:rag-client",
     "prepare": "husky || true"
   },

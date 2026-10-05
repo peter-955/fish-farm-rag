@@ -2,10 +2,20 @@
   "$schema": "https://turbo.build/schema.json",
   "agentGuidance": false,
   "tasks": {
-    "build": { "dependsOn": ["^build"], "outputs": ["dist/**", ".next/**", "!.next/cache/**"] },
-    "dev": { "cache": false, "persistent": true },
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
     "lint": {},
-    "typecheck": { "dependsOn": ["^build"] },
-    "test": {}
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
+      "env": ["TEST_DATABASE_URL"]
+    }
   }
 }
